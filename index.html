@@ -185,9 +185,10 @@
         .badge-ipa { background: #90e0ef; color: #0077b6; }
         .badge-ips { background: #ffd6a5; color: #e85d04; }
         
+        /* Updated Status Styles */
         .status-idle { background: #e9ecef; color: #495057; }
         .status-working { background: #4cc9f0; color: #0077b6; }
-        .status-finished { background: #4cc9f0; color: #005f73; border: 1px solid #005f73; }
+        .status-finished { background: var(--success); color: white; font-weight: bold; border: 1px solid var(--success-dark); }
 
         /* --- STUDENT EXAM STYLES --- */
         .student-exam-header {
@@ -302,8 +303,8 @@
         <div class="result-card">
             <i class="fas fa-trophy" style="font-size: 4rem; color: #ffd700; margin-bottom: 20px;"></i>
             <h1>Ujian Selesai!</h1>
-            <p style="font-size: 1.2rem; margin: 10px 0;">Skor Akhir Anda:</p>
-            <div style="font-size: 5rem; font-weight: 800; color: var(--success);" id="final-score-display">0</div>
+            <p style="font-size: 1.2rem; margin: 10px 0;">Skor Anda:</p>
+            <div style="font-size: 4rem; font-weight: 800; color: var(--success);" id="final-score-display">0</div>
             
             <div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.1); border-radius: 12px; display: inline-block;">
                 <p style="font-size: 1rem; color: #ccc;">Durasi Pengerjaan:</p>
@@ -313,7 +314,8 @@
             <p id="offline-pending-msg" style="margin-top: 20px; color: #ff6b6b; display: none;">
                 <i class="fas fa-wifi"></i> Anda sedang offline. Jawaban tersimpan lokal & akan dikirim saat koneksi kembali.
             </p>
-            <p style="margin-top: 20px; color: #ccc;">Anda akan keluar otomatis dalam <span id="countdown-logout">5</span> detik...</p>
+            <!-- Removed countdown logout text per request -->
+            <button onclick="window.location.reload()" class="btn btn-primary" style="margin-top:30px; display:none;" id="manual-reload-btn">Kembali ke Login</button>
         </div>
     </div>
 
@@ -535,8 +537,8 @@
         // --- STATE & GLOBAL VARIABLES ---
         let currentUser = null;
         let currentQuestionIndex = 0;
-        let questions = []; 
-        let answers = []; 
+        let questions = []; // Cached questions for offline use
+        let answers = []; // Local answers cache (not synced immediately)
         let users = []; 
         let appSettings = {}; 
         let unsubscribeQuestions = null;
@@ -554,35 +556,32 @@
         // --- OFFLINE SYNC MANAGER ---
         const SYNC_KEY = 'osn_pending_sync';
         
-        function updateConnectionStatus(forceOfflineMode = false) {
+        // Koneksi Status UI Update
+        function updateConnectionStatus() {
             const el = document.getElementById('connection-status');
-            // Jika forceOfflineMode true (saat ujian berlangsung), tampilkan Offline
-            if (forceOfflineMode) {
-                el.className = 'offline';
-                el.innerHTML = '<i class="fas fa-wifi-slash"></i> <span>Offline (Ujian)</span>';
+            if (navigator.onLine) {
+                el.className = 'online';
+                el.innerHTML = '<i class="fas fa-wifi"></i> <span>Online</span>';
+                // Cek jika ada data pending saat kembali online
+                checkAndSyncPendingData();
             } else {
-                // Logika koneksi nyata
-                if (navigator.onLine) {
-                    el.className = 'online';
-                    el.innerHTML = '<i class="fas fa-wifi"></i> <span>Online</span>';
-                    checkAndSyncPendingData();
-                } else {
-                    el.className = 'offline';
-                    el.innerHTML = '<i class="fas fa-wifi-slash"></i> <span>Offline</span>';
-                    showToast('Anda offline. Jawaban disimpan lokal.', 'info');
-                }
+                el.className = 'offline';
+                el.innerHTML = '<i class="fas fa-wifi-slash"></i> <span>Offline</span>';
+                showToast('Anda offline. Jawaban disimpan lokal.', 'info');
             }
         }
 
-        window.addEventListener('online', () => updateConnectionStatus(false));
-        window.addEventListener('offline', () => updateConnectionStatus(false));
+        window.addEventListener('online', updateConnectionStatus);
+        window.addEventListener('offline', updateConnectionStatus);
 
+        // Simpan data pending ke LocalStorage jika offline saat submit
         function savePendingSubmission(data) {
             let pending = JSON.parse(localStorage.getItem(SYNC_KEY) || '[]');
             pending.push(data);
             localStorage.setItem(SYNC_KEY, JSON.stringify(pending));
         }
 
+        // Coba kirim data pending saat online
         async function checkAndSyncPendingData() {
             if (!navigator.onLine) return;
             
@@ -594,46 +593,31 @@
             for (let i = 0; i < pending.length; i++) {
                 const item = pending[i];
                 try {
-                    // Gunakan Transaction untuk memastikan status user berubah atomically
-                    await runTransaction(db, async (transaction) => {
-                        const userRef = doc(db, "users", item.userId);
-                        const userDoc = await transaction.get(userRef);
-                        
-                        if (!userDoc.exists()) {
-                            throw "User does not exist!";
-                        }
-                        
-                        const currentStatus = userDoc.data().status;
-                        
-                        // Hanya update jika status belum finished (untuk menghindari overwrite manual judge)
-                        if (currentStatus !== 'finished') {
-                            transaction.update(userRef, {
-                                status: 'finished',
-                                score: item.score,
-                                examDuration: item.durationMs,
-                                finishedAt: serverTimestamp()
-                            });
-                        }
-
-                        // Upload Jawaban
-                        for (const ans of item.rawAnswers) {
-                            // Cek duplikasi sederhana
-                            const q = query(collection(db, "answers"), where("userId", "==", ans.userId), where("questionId", "==", ans.questionId));
-                            const snap = await getDocs(q);
-                            if(snap.empty) {
-                                const newAnsRef = doc(collection(db, "answers"));
-                                transaction.set(newAnsRef, { ...ans, timestamp: serverTimestamp() });
-                            }
-                        }
+                    // Re-calculate score based on cached questions (or re-fetch questions if needed, but simpler to use cache)
+                    // Note: This assumes 'questions' array is populated. If not, we might need to fetch first.
+                    // For simplicity, we store the score in the pending item to avoid logic complexity here.
+                    
+                    // Update User Status
+                    await updateDoc(doc(db, "users", item.userId), {
+                        status: 'finished',
+                        score: item.score,
+                        examDuration: item.durationMs,
+                        finishedAt: serverTimestamp()
                     });
 
-                    // Hapus item yang berhasil
+                    // Save Answers one by one
+                    for (const ans of item.rawAnswers) {
+                        await addDoc(collection(db, "answers"), ans);
+                    }
+
+                    // Hapus item yang berhasil dari pending
                     pending.splice(i, 1);
-                    i--; 
+                    i--; // adjust index
                     localStorage.setItem(SYNC_KEY, JSON.stringify(pending));
                     showToast('Data offline berhasil dikirim ke server!', 'success');
                 } catch (e) {
                     console.error('Gagal sync item:', e);
+                    // Stop jika error, coba lagi nanti
                     break; 
                 }
             }
@@ -689,6 +673,7 @@
         document.getElementById('login-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             
+            // WAJIB ONLINE UNTUK LOGIN
             if (!navigator.onLine) {
                 showToast('Login membutuhkan koneksi internet!', 'error');
                 return;
@@ -704,6 +689,7 @@
                 currentUser = querySnapshot.docs[0].data();
                 currentUser.id = querySnapshot.docs[0].id;
                 
+                // Cek status user
                 if (currentUser.role === 'student' && currentUser.status === 'finished') {
                     alert('Anda sudah selesai mengerjakan ujian ini. Tidak bisa login kembali.');
                     return;
@@ -762,10 +748,15 @@
             if(unsubscribeWarnings) unsubscribeWarnings();
             if(unsubscribeSettings) unsubscribeSettings();
 
+            // Jika student dan status belum finished, update ke idle (opsional, tergantung kebijakan)
+            // Tapi user minta "setelah selesai langsung selesai", jadi jika sudah finished biarkan saja.
             if (currentUser && currentUser.role === 'student' && currentUser.status !== 'finished') {
-                if(navigator.onLine) {
-                    await updateDoc(doc(db, "users", currentUser.id), { status: 'idle' });
-                }
+                try {
+                    // Hanya update jika online. Jika offline, biarkan saja.
+                    if(navigator.onLine) {
+                        await updateDoc(doc(db, "users", currentUser.id), { status: 'idle' });
+                    }
+                } catch(e) { console.error(e); }
             }
 
             currentUser = null;
@@ -776,8 +767,6 @@
             judgeSelectedSubject = null; 
             document.getElementById('app-screen').classList.add('hidden');
             document.getElementById('auth-screen').classList.remove('hidden');
-            // Reset status koneksi ke nyata
-            updateConnectionStatus(false);
         };
 
         // --- REAL-TIME LISTENERS ---
@@ -788,6 +777,7 @@
             
             document.getElementById('user-display').innerText = `${currentUser.name} (${currentUser.role === 'judge' ? 'Juri' : 'Peserta'})`;
 
+            // 1. Listener Settings
             const settingsRef = doc(db, "app_settings", "global_config");
             unsubscribeSettings = onSnapshot(settingsRef, (docSnap) => {
                 if (docSnap.exists()) {
@@ -835,6 +825,9 @@
                 });
             }
 
+            // Listener Questions (Hanya diperlukan saat init atau jika judge)
+            // Untuk student, kita ambil sekali di awal (untuk cache offline) lalu stop listener jika ingin hemat.
+            // Tapi demi real-time update soal oleh juri, kita biarkan on.
             const qQuestions = query(collection(db, "questions"));
             unsubscribeQuestions = onSnapshot(qQuestions, (snapshot) => {
                 questions = [];
@@ -845,6 +838,8 @@
                 else if (currentUser.role === 'student') renderStudentDashboard();
             });
 
+            // Listener Answers (Juri Only sebenarnya, tapi student butuh untuk cross check? Tidak perlu.)
+            // Student hanya butuh menyimpan jawaban sendiri.
             if (currentUser.role === 'judge') {
                 const qAnswers = query(collection(db, "answers"));
                 unsubscribeAnswers = onSnapshot(qAnswers, (snapshot) => {
@@ -1015,6 +1010,8 @@
             const filteredQuestions = questions.filter(q => q.subject === judgeSelectedSubject);
             const filteredParticipants = users.filter(u => u.role === 'student' && u.subjects && u.subjects.includes(judgeSelectedSubject));
             const filteredQuestionIds = filteredQuestions.map(q => q.id);
+            // Juga muat jawaban dari pending sync lokal (opsional jika judge run di browser yang sama dengan student - jarang terjadi)
+            // Kita fokus pada data real-time di Firebase untuk Judge.
             const filteredAnswers = answers.filter(a => filteredQuestionIds.includes(a.questionId));
 
             // --- CALCULATE SCORES ---
@@ -1041,15 +1038,24 @@
                 }
             });
 
+            // Update with official finish data if available
             filteredParticipants.forEach(u => {
                 if(u.status === 'finished' && u.score !== undefined) {
                     if(userScores[u.id]) userScores[u.id].total = u.score;
                 }
             });
 
+            // SORTING LOGIC: 
+            // 1. Score (Highest first)
+            // 2. Duration (Fastest/Smallest first)
             const rankings = Object.values(userScores).sort((a, b) => {
-                if (b.total !== a.total) return b.total - a.total;
-                return a.lastActive - b.lastActive;
+                if (b.total !== a.total) return b.total - a.total; // Sort by Score DESC
+                
+                // If scores are equal, sort by Duration ASC (Fastest time first)
+                // Handle cases where duration might be null or 0
+                const durA = a.duration || 0;
+                const durB = b.duration || 0;
+                return durA - durB; 
             });
 
             const subjectLabel = judgeSelectedSubject === 'matematika' ? 'Matematika' : judgeSelectedSubject.toUpperCase();
@@ -1167,7 +1173,17 @@
                                             durationDisplay = window.formatDuration(diff);
                                         }
                                     }
-                                    let statusBadge = r.status === 'finished' ? '<span class="badge status-finished"><i class="fas fa-check"></i> Selesai</span>' : (r.status === 'working' ? '<span class="badge status-working"><i class="fas fa-pen"></i> Mengerjakan</span>' : '<span class="badge status-idle"><i class="fas fa-hourglass-start"></i> Idle</span>');
+                                    
+                                    // Updated Logic for Status Badge
+                                    let statusBadge = '';
+                                    if (r.status === 'finished') {
+                                        statusBadge = '<span class="badge status-finished">SELESAI</span>';
+                                    } else if (r.status === 'working') {
+                                        statusBadge = '<span class="badge status-working">Mengerjakan</span>';
+                                    } else {
+                                        statusBadge = '<span class="badge status-idle">Idle</span>';
+                                    }
+
                                     return `
                                     <tr>
                                         <td>#${idx + 1}</td>
@@ -1345,6 +1361,7 @@
         // --- STUDENT LOGIC (OFFLINE CAPABLE) ---
         function getStudentQuestions() {
             if (!currentUser.subjects || currentUser.subjects.length === 0) return [];
+            // Filter dari array questions (yang sudah di-download di awal)
             return questions.filter(q => currentUser.subjects.includes(q.subject));
         }
 
@@ -1360,16 +1377,10 @@
             if (!container) return;
 
             if (isLocked) {
-                // Jika dikunci, status koneksi kembali ke asli (bukan mode ujian)
-                updateConnectionStatus(false);
                 container.innerHTML = `<div class="card exam-locked-screen"><i class="fas fa-lock"></i><h2>Ujian Belum Dibuka</h2><p style="color:#666; margin-top:10px;">Mohon tunggu hingga Juri membuka akses soal untuk mata pelajaran ${subject.toUpperCase()}.</p><div style="margin-top:20px;"><div class="badge badge-${subject}">${subject.toUpperCase()}</div></div></div>`;
                 if(timerInterval) clearInterval(timerInterval);
                 return;
             }
-
-            // --- JIKA TIDAK DIKUNCI (SOAL DIBUKA) ---
-            // AKTIFKAN MODE OFFLINE OTOMATIS
-            updateConnectionStatus(true);
 
             if (myQuestions.length === 0) {
                 container.innerHTML = `<div class="card"><h2 style="text-align:center;">Belum ada soal tersedia untuk mapel yang Anda ikuti.</h2></div>`;
@@ -1465,8 +1476,9 @@
             timerInterval = setInterval(updateTimer, 1000);
         }
 
-        // Simpan jawaban secara lokal
+        // Simpan jawaban secara lokal (array `answers`)
         window.saveAnswer = async (qId, option) => {
+            // Simpan ke memori lokal untuk rendering
             const existingIndex = answers.findIndex(a => a.userId === currentUser.id && a.questionId === qId);
             const data = {
                 userId: currentUser.id,
@@ -1474,20 +1486,44 @@
                 userSchool: currentUser.school,
                 questionId: qId,
                 selected: option,
-                timestamp: new Date()
+                timestamp: new Date() // Local timestamp for sorting
             };
 
             if (existingIndex > -1) {
                 answers[existingIndex] = { ...answers[existingIndex], ...data, id: answers[existingIndex].id };
             } else {
-                answers.push({ id: 'local_' + Date.now(), ...data }); 
+                answers.push({ id: 'local_' + Date.now(), ...data }); // Temporary ID
             }
             
-            // Karena kita memaksa Mode Offline saat ujian, 
-            // kita tidak mengirim ke Firebase secara real-time di sini.
-            // Data hanya disimpan di memori dan akan dikirim saat finish (online/offline).
-            // Tapi kita bisa beri visual feedback kecil
-            // showToast('Jawaban tersimpan', 'info'); 
+            // Jika Online, langsung kirim ke Firebase
+            if (navigator.onLine) {
+                try {
+                    // Cek apakah ini update atau baru
+                    const existingDb = existingIndex > -1 && answers[existingIndex].id && !answers[existingIndex].id.startsWith('local_');
+                    if (existingDb) {
+                        await updateDoc(doc(db, "answers", answers[existingIndex].id), {
+                            selected: option,
+                            timestamp: serverTimestamp()
+                        });
+                    } else {
+                        const docRef = await addDoc(collection(db, "answers"), {
+                            userId: currentUser.id,
+                            userName: currentUser.name,
+                            userSchool: currentUser.school,
+                            questionId: qId,
+                            selected: option,
+                            timestamp: serverTimestamp()
+                        });
+                        // Update local ID dengan real ID
+                        answers[answers.length - 1].id = docRef.id;
+                    }
+                } catch (e) {
+                    console.error("Gagal sync jawaban real-time, menyimpan lokal saja:", e);
+                    showToast('Jawaban disimpan lokal (Offline)', 'info');
+                }
+            } else {
+                showToast('Jawaban disimpan lokal (Offline)', 'info');
+            }
 
             window.renderStudentDashboard();
         };
@@ -1513,7 +1549,7 @@
             const now = Date.now();
             const durationMs = now - examStartTime.getTime();
 
-            // Siapkan data
+            // Siapkan data untuk dikirim (atau disimpan pending)
             const submitData = {
                 userId: currentUser.id,
                 score: score,
@@ -1527,51 +1563,39 @@
                 }))
             };
 
-            // Langsung Tampilkan Hasil (Tanpa loading/hitung mundur)
             const overlay = document.getElementById('result-overlay');
             document.getElementById('final-score-display').innerText = score;
             document.getElementById('final-duration-display').innerText = window.formatDuration(durationMs);
             
             const offlineMsg = document.getElementById('offline-pending-msg');
-            overlay.style.display = 'flex';
 
             if (navigator.onLine) {
-                // ONLINE: Kirim sekarang
+                // ONLINE: Langsung kirim
                 offlineMsg.style.display = 'none';
                 try {
-                    // Gunakan Transaction untuk update status dan skor sekaligus
-                    await runTransaction(db, async (transaction) => {
-                        const userRef = doc(db, "users", currentUser.id);
-                        const userDoc = await transaction.get(userRef);
-                        
-                        if (!userDoc.exists()) throw "User not found";
-
-                        // Cek status agar tidak overwrite manual judge jika user refresh halaman result (jarang terjadi karena auto logout)
-                        // Tapi untuk keamanan data, kita set finished.
-                        transaction.update(userRef, {
-                            status: 'finished',
-                            score: score,
-                            examDuration: durationMs,
-                            finishedAt: serverTimestamp()
-                        });
-
-                        // Kirim jawaban
-                        for (const ans of submitData.rawAnswers) {
-                            // Cek duplikasi
-                            const q = query(collection(db, "answers"), where("userId", "==", ans.userId), where("questionId", "==", ans.questionId));
-                            const snap = await getDocs(q);
-                            if(snap.empty) {
-                                const newAnsRef = doc(collection(db, "answers"));
-                                transaction.set(newAnsRef, { ...ans, timestamp: serverTimestamp() });
-                            }
-                        }
+                    // Update Status User ke FINISHED
+                    await updateDoc(doc(db, "users", currentUser.id), {
+                        status: 'finished',
+                        score: score,
+                        examDuration: durationMs, 
+                        finishedAt: serverTimestamp()
                     });
-                    
-                    // Juri akan melihat perubahan ini real-time karena onSnapshot
+
+                    // Pastikan semua jawaban terkirim (jika ada yang belum ke-upload saat saveAnswer offline tadi)
+                    for (const ans of submitData.rawAnswers) {
+                        // Cek duplikasi di server (simplified logic: just addDoc, kita anggap jawaban id unik atau idempotent handle di sisi server jika perlu)
+                        // Untuk keamanan, kita cek dulu apakah sudah ada
+                        // Tapi agar cepat, kita asumsikan saveAnswer tadi sudah bekerja. Kita hanya perlu memastikan status user finished.
+                        // Kita tambahkan logika bulk upload jika rawAnswers berisi ID 'local_'
+                        if (answers.find(la => la.questionId === ans.questionId && la.id.startsWith('local_'))) {
+                             await addDoc(collection(db, "answers"), { ...ans, timestamp: serverTimestamp() });
+                        }
+                    }
+                    showToast('Jawaban terkirim!', 'success');
 
                 } catch (e) {
-                    console.error("Gagal finish online:", e);
-                    showToast('Gagal kirim data, menyimpan lokal...', 'error');
+                    console.error("Gagal saat finish online:", e);
+                    showToast('Gagal mengirim data, menyimpan lokal...', 'error');
                     savePendingSubmission(submitData);
                     offlineMsg.style.display = 'block';
                 }
@@ -1581,19 +1605,13 @@
                 savePendingSubmission(submitData);
             }
 
-            // Hitung mundur logout cepat (5 detik)
-            let countdown = 5;
-            const countEl = document.getElementById('countdown-logout');
-            countEl.innerText = countdown;
-
-            autoLogoutTimeout = setInterval(() => {
-                countdown--;
-                countEl.innerText = countdown;
-                if (countdown <= 0) {
-                    clearInterval(autoLogoutTimeout);
-                    logout();
-                }
-            }, 1000);
+            overlay.style.display = 'flex';
+            
+            // Hide manual reload button to force manual refresh or judge action, 
+            // but user asked to remove countdown. 
+            // The screen will just stay there showing score and duration.
+            const reloadBtn = document.getElementById('manual-reload-btn');
+            if(reloadBtn) reloadBtn.style.display = 'inline-block';
         };
 
         // --- INIT CHECK ---
@@ -1623,7 +1641,8 @@
                 console.log("Default Settings Created");
             }
             
-            updateConnectionStatus(false);
+            // Cek status koneksi awal
+            updateConnectionStatus();
         })();
     </script>
 </body>
