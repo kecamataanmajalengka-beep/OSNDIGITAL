@@ -166,6 +166,14 @@
             display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100;
         }
         .logo { font-size: 1.2rem; font-weight: 800; color: var(--primary); display: flex; align-items: center; gap: 8px; }
+        
+        /* Connection Status Indicator */
+        #connection-status {
+            font-size: 0.8rem; font-weight: bold; padding: 4px 10px; border-radius: 12px; display: flex; align-items: center; gap: 5px;
+        }
+        #connection-status.online { background: #d1e7dd; color: #0f5132; }
+        #connection-status.offline { background: #f8d7da; color: #842029; }
+
         main { padding: 20px; max-width: 1000px; margin: 0 auto; width: 100%; flex: 1; padding-bottom: 100px; }
 
         .dashboard-grid { display: grid; grid-template-columns: 1fr; gap: 15px; margin-bottom: 30px; }
@@ -237,6 +245,7 @@
         .toast { background: var(--dark); color: white; padding: 15px 25px; border-radius: 12px; margin-top: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); animation: slideIn 0.3s ease; display: flex; align-items: center; gap: 10px; }
         .toast.success { border-left: 4px solid var(--success); }
         .toast.error { border-left: 4px solid var(--danger); }
+        .toast.info { border-left: 4px solid var(--primary); }
         @keyframes slideIn { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
         table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.9rem; }
@@ -264,7 +273,7 @@
         @media print {
             @page { margin: 1cm; size: landscape; }
             body { background: white; -webkit-print-color-adjust: exact; }
-            header, #toast-container, .btn, .dashboard-grid, .switch-container, .btn-tab { display: none !important; }
+            header, #toast-container, .btn, .dashboard-grid, .switch-container, .btn-tab, #connection-status { display: none !important; }
             main { padding: 0; margin: 0; max-width: 100%; }
             .card { box-shadow: none; border: 1px solid #ddd; padding: 0; margin: 0; }
             .table-responsive { overflow: visible; }
@@ -301,6 +310,9 @@
                 <div style="font-size: 2rem; font-weight: bold; color: white;" id="final-duration-display">0m 0s</div>
             </div>
 
+            <p id="offline-pending-msg" style="margin-top: 20px; color: #ff6b6b; display: none;">
+                <i class="fas fa-wifi"></i> Anda sedang offline. Jawaban tersimpan lokal & akan dikirim saat koneksi kembali.
+            </p>
             <p style="margin-top: 20px; color: #ccc;">Anda akan keluar otomatis dalam <span id="countdown-logout">5</span> detik...</p>
         </div>
     </div>
@@ -311,6 +323,11 @@
             <div class="logo" style="justify-content: center; margin-bottom: 20px;">
                 <i class="fas fa-brain"></i> OSN KECAMATAN MAJALENGKA<br><span style="font-size:0.7em; font-weight:normal;">TAHUN 2026</span>
             </div>
+            
+            <div style="margin-bottom: 20px; font-size: 0.9rem; color: #666;">
+                <i class="fas fa-info-circle"></i> Login wajib Online. Setelah masuk, mode ujian bekerja Offline.
+            </div>
+
             <div class="auth-tabs">
                 <div class="auth-tab active" onclick="switchAuthTab('login')">Masuk</div>
                 <div class="auth-tab" onclick="switchAuthTab('register')">Daftar</div>
@@ -347,6 +364,11 @@
         <header>
             <div class="logo"><i class="fas fa-brain"></i> OSN KECAMATAN MAJALENGKA</div>
             <div style="display: flex; align-items: center; gap: 10px;">
+                <!-- Connection Status -->
+                <div id="connection-status" class="online">
+                    <i class="fas fa-wifi"></i> <span>Online</span>
+                </div>
+
                 <span id="user-display" style="font-weight: 600; font-size: 0.9rem;">User</span>
                 <button id="switch-subject-btn" onclick="window.switchJudgeSubject()" class="btn btn-warning hidden" style="padding: 6px 12px; font-size: 0.8rem;"><i class="fas fa-exchange-alt"></i> Ganti Mapel</button>
                 <button onclick="logout()" class="btn btn-outline" style="padding: 6px 12px; font-size: 0.8rem;"><i class="fas fa-sign-out-alt"></i> Keluar</button>
@@ -495,7 +517,7 @@
     <!-- FIREBASE SDK -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-app.js";
-        import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, query, where, onSnapshot, setDoc, getDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, query, where, onSnapshot, setDoc, getDoc, serverTimestamp, runTransaction } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyA7Jdb6YVm5MgApxf8q2dF901aUOf62bEo",
@@ -513,8 +535,8 @@
         // --- STATE & GLOBAL VARIABLES ---
         let currentUser = null;
         let currentQuestionIndex = 0;
-        let questions = [];
-        let answers = [];
+        let questions = []; // Cached questions for offline use
+        let answers = []; // Local answers cache (not synced immediately)
         let users = []; 
         let appSettings = {}; 
         let unsubscribeQuestions = null;
@@ -528,6 +550,76 @@
         
         // Juri Focus Mode Variable
         let judgeSelectedSubject = null; 
+
+        // --- OFFLINE SYNC MANAGER ---
+        const SYNC_KEY = 'osn_pending_sync';
+        
+        // Koneksi Status UI Update
+        function updateConnectionStatus() {
+            const el = document.getElementById('connection-status');
+            if (navigator.onLine) {
+                el.className = 'online';
+                el.innerHTML = '<i class="fas fa-wifi"></i> <span>Online</span>';
+                // Cek jika ada data pending saat kembali online
+                checkAndSyncPendingData();
+            } else {
+                el.className = 'offline';
+                el.innerHTML = '<i class="fas fa-wifi-slash"></i> <span>Offline</span>';
+                showToast('Anda offline. Jawaban disimpan lokal.', 'info');
+            }
+        }
+
+        window.addEventListener('online', updateConnectionStatus);
+        window.addEventListener('offline', updateConnectionStatus);
+
+        // Simpan data pending ke LocalStorage jika offline saat submit
+        function savePendingSubmission(data) {
+            let pending = JSON.parse(localStorage.getItem(SYNC_KEY) || '[]');
+            pending.push(data);
+            localStorage.setItem(SYNC_KEY, JSON.stringify(pending));
+        }
+
+        // Coba kirim data pending saat online
+        async function checkAndSyncPendingData() {
+            if (!navigator.onLine) return;
+            
+            let pending = JSON.parse(localStorage.getItem(SYNC_KEY) || '[]');
+            if (pending.length === 0) return;
+
+            console.log(`Mencoba sinkronisasi ${pending.length} data pending...`);
+
+            for (let i = 0; i < pending.length; i++) {
+                const item = pending[i];
+                try {
+                    // Re-calculate score based on cached questions (or re-fetch questions if needed, but simpler to use cache)
+                    // Note: This assumes 'questions' array is populated. If not, we might need to fetch first.
+                    // For simplicity, we store the score in the pending item to avoid logic complexity here.
+                    
+                    // Update User Status
+                    await updateDoc(doc(db, "users", item.userId), {
+                        status: 'finished',
+                        score: item.score,
+                        examDuration: item.durationMs,
+                        finishedAt: serverTimestamp()
+                    });
+
+                    // Save Answers one by one
+                    for (const ans of item.rawAnswers) {
+                        await addDoc(collection(db, "answers"), ans);
+                    }
+
+                    // Hapus item yang berhasil dari pending
+                    pending.splice(i, 1);
+                    i--; // adjust index
+                    localStorage.setItem(SYNC_KEY, JSON.stringify(pending));
+                    showToast('Data offline berhasil dikirim ke server!', 'success');
+                } catch (e) {
+                    console.error('Gagal sync item:', e);
+                    // Stop jika error, coba lagi nanti
+                    break; 
+                }
+            }
+        }
 
         // --- KIOSK MODE / SECURITY SCRIPTS ---
         document.addEventListener('contextmenu', event => event.preventDefault());
@@ -548,7 +640,7 @@
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
-            toast.innerHTML = `<i class="fas ${type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'}"></i><span>${msg}</span>`;
+            toast.innerHTML = `<i class="fas ${type === 'success' ? 'fa-check-circle' : type === 'info' ? 'fa-info-circle' : 'fa-exclamation-circle'}"></i><span>${msg}</span>`;
             container.appendChild(toast);
             setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 3000);
         };
@@ -578,6 +670,13 @@
 
         document.getElementById('login-form').addEventListener('submit', async (e) => {
             e.preventDefault();
+            
+            // WAJIB ONLINE UNTUK LOGIN
+            if (!navigator.onLine) {
+                showToast('Login membutuhkan koneksi internet!', 'error');
+                return;
+            }
+
             const username = document.getElementById('login-username').value;
             const password = document.getElementById('login-password').value;
             
@@ -587,6 +686,13 @@
             if (!querySnapshot.empty) {
                 currentUser = querySnapshot.docs[0].data();
                 currentUser.id = querySnapshot.docs[0].id;
+                
+                // Cek status user
+                if (currentUser.role === 'student' && currentUser.status === 'finished') {
+                    alert('Anda sudah selesai mengerjakan ujian ini. Tidak bisa login kembali.');
+                    return;
+                }
+
                 if(currentUser.role === 'judge') {
                     judgeSelectedSubject = null; 
                 }
@@ -599,6 +705,11 @@
 
         document.getElementById('register-form').addEventListener('submit', async (e) => {
             e.preventDefault();
+            if (!navigator.onLine) {
+                showToast('Pendaftaran membutuhkan koneksi internet!', 'error');
+                return;
+            }
+
             const name = document.getElementById('reg-name').value;
             const username = document.getElementById('reg-username').value;
             const school = document.getElementById('reg-school').value;
@@ -635,12 +746,15 @@
             if(unsubscribeWarnings) unsubscribeWarnings();
             if(unsubscribeSettings) unsubscribeSettings();
 
-            if (currentUser && currentUser.role === 'student') {
-                if (currentUser.status !== 'finished') {
-                    try {
+            // Jika student dan status belum finished, update ke idle (opsional, tergantung kebijakan)
+            // Tapi user minta "setelah selesai langsung selesai", jadi jika sudah finished biarkan saja.
+            if (currentUser && currentUser.role === 'student' && currentUser.status !== 'finished') {
+                try {
+                    // Hanya update jika online. Jika offline, biarkan saja.
+                    if(navigator.onLine) {
                         await updateDoc(doc(db, "users", currentUser.id), { status: 'idle' });
-                    } catch(e) { console.error(e); }
-                }
+                    }
+                } catch(e) { console.error(e); }
             }
 
             currentUser = null;
@@ -661,14 +775,12 @@
             
             document.getElementById('user-display').innerText = `${currentUser.name} (${currentUser.role === 'judge' ? 'Juri' : 'Peserta'})`;
 
-            // 1. Listener Settings (PENTING: Ini membuat Lock/Buka jadi Real-time)
+            // 1. Listener Settings
             const settingsRef = doc(db, "app_settings", "global_config");
             unsubscribeSettings = onSnapshot(settingsRef, (docSnap) => {
                 if (docSnap.exists()) {
                     appSettings = docSnap.data();
-                    console.log("Settings updated:", appSettings);
                 } else {
-                    // Create default if not exists
                     appSettings = { 
                         locks: { matematika: true, ipa: true, ips: true },
                         durations: { matematika: 60, ipa: 60, ips: 60 } 
@@ -676,7 +788,6 @@
                     setDoc(settingsRef, appSettings, {merge: true});
                 }
                 
-                // Re-render based on role
                 if (currentUser.role === 'judge' && judgeSelectedSubject) renderJudgeDashboard();
                 else if (currentUser.role === 'student') renderStudentDashboard();
             });
@@ -712,7 +823,9 @@
                 });
             }
 
-            // Listener Questions
+            // Listener Questions (Hanya diperlukan saat init atau jika judge)
+            // Untuk student, kita ambil sekali di awal (untuk cache offline) lalu stop listener jika ingin hemat.
+            // Tapi demi real-time update soal oleh juri, kita biarkan on.
             const qQuestions = query(collection(db, "questions"));
             unsubscribeQuestions = onSnapshot(qQuestions, (snapshot) => {
                 questions = [];
@@ -723,25 +836,27 @@
                 else if (currentUser.role === 'student') renderStudentDashboard();
             });
 
-            // Listener Answers
-            const qAnswers = query(collection(db, "answers"));
-            unsubscribeAnswers = onSnapshot(qAnswers, (snapshot) => {
-                answers = [];
-                snapshot.forEach((doc) => {
-                    answers.push({ id: doc.id, ...doc.data() });
+            // Listener Answers (Juri Only sebenarnya, tapi student butuh untuk cross check? Tidak perlu.)
+            // Student hanya butuh menyimpan jawaban sendiri.
+            if (currentUser.role === 'judge') {
+                const qAnswers = query(collection(db, "answers"));
+                unsubscribeAnswers = onSnapshot(qAnswers, (snapshot) => {
+                    answers = [];
+                    snapshot.forEach((doc) => {
+                        answers.push({ id: doc.id, ...doc.data() });
+                    });
+                    renderJudgeDashboard(); 
                 });
-                if (currentUser.role === 'judge' && judgeSelectedSubject) renderJudgeDashboard(); 
-            });
 
-            // Listener Users
-            const qUsers = query(collection(db, "users"));
-            unsubscribeUsers = onSnapshot(qUsers, (snapshot) => {
-                users = [];
-                snapshot.forEach((doc) => {
-                    users.push({ id: doc.id, ...doc.data() });
+                const qUsers = query(collection(db, "users"));
+                unsubscribeUsers = onSnapshot(qUsers, (snapshot) => {
+                    users = [];
+                    snapshot.forEach((doc) => {
+                        users.push({ id: doc.id, ...doc.data() });
+                    });
+                    renderJudgeDashboard();
                 });
-                if (currentUser.role === 'judge' && judgeSelectedSubject) renderJudgeDashboard();
-            });
+            }
         }
 
         // --- WARNING SYSTEM ---
@@ -754,6 +869,7 @@
         }
 
         window.sendWarningToUser = async (userId, message) => {
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             try {
                 await addDoc(collection(db, "warnings"), {
                     userId: userId,
@@ -767,6 +883,7 @@
         };
 
         window.sendGlobalWarning = async (message) => {
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             try {
                 const filteredParticipants = users.filter(u => u.role === 'student' && u.subjects && u.subjects.includes(judgeSelectedSubject));
                 const batch = [];
@@ -800,26 +917,13 @@
             document.getElementById('switch-subject-btn').classList.add('hidden');
         };
 
-        // --- UPDATE CONFIG LOCK SYSTEM (FIXED) ---
         window.updateSubjectConfig = async (subject, field, value) => {
-            // Tampilkan loading state pada tombol/switch jika perlu
-            // Kita langsung update ke Firebase
-            
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             try {
                 const settingsRef = doc(db, "app_settings", "global_config");
                 const updateData = {};
-                // field = 'locks' or 'durations'
-                // value = boolean (for locks) or number (for durations)
-                
-                // PENTING: Kita menggunakan merge: true agar tidak menimpa settingan mapel lain
                 updateData[`${field}.${subject}`] = value;
-                
                 await updateDoc(settingsRef, updateData); 
-                // Note: onSnapshot di line 383 akan menangkap perubahan ini dan merender ulang UI secara otomatis
-                
-                // Feedback sukses
-                // showToast(`Konfigurasi ${subject.toUpperCase()} diperbarui`, 'success'); 
-                // Optional: Jika ingin toast, aktifkan baris atas, tapi karena ini realtime mungkin akan spam toast.
             } catch (e) {
                 console.error(e);
                 showToast('Gagal mengubah konfigurasi: ' + e.message, 'error');
@@ -830,20 +934,16 @@
         window.openScoreModal = (userId, currentScore, currentDurationMs) => {
             const modal = document.getElementById('edit-score-modal');
             const user = users.find(u => u.id === userId);
-            
-            if(user) {
-                document.getElementById('edit-modal-user-name').innerText = `${user.name} (${user.school})`;
-            }
+            if(user) document.getElementById('edit-modal-user-name').innerText = `${user.name} (${user.school})`;
             document.getElementById('edit-user-id').value = userId;
             document.getElementById('edit-score-input').value = currentScore;
-            
             let minutes = Math.floor(currentDurationMs / 60000);
             document.getElementById('edit-duration-input').value = minutes > 0 ? minutes : '';
-            
             modal.style.display = 'flex';
         };
 
         window.saveManualScore = async () => {
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             const userId = document.getElementById('edit-user-id').value;
             const newScore = parseInt(document.getElementById('edit-score-input').value);
             const newDurationMinutes = parseInt(document.getElementById('edit-duration-input').value);
@@ -873,39 +973,29 @@
         window.printRanking = () => {
             const subjectLabel = judgeSelectedSubject === 'matematika' ? 'Matematika' : judgeSelectedSubject.toUpperCase();
             document.getElementById('print-subject-title').innerText = `LAPORAN PERINGKAT - ${subjectLabel}`;
-            
             const now = new Date();
             const dateStr = now.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
             document.getElementById('print-date').innerText = dateStr;
-
             const dashboardTable = document.querySelector('#main-content table');
             const printContainer = document.getElementById('print-table-container');
-            
             if (dashboardTable) {
                 const clonedTable = dashboardTable.cloneNode(true);
-                // Hapus kolom aksi terakhir saat print
                 Array.from(clonedTable.rows).forEach(row => {
-                    if(row.cells.length > 5) {
-                        row.deleteCell(5); 
-                    }
+                    if(row.cells.length > 5) row.deleteCell(5); 
                 });
-                
                 clonedTable.style.width = '100%';
                 clonedTable.style.borderCollapse = 'collapse';
                 clonedTable.style.fontSize = '12px';
-                
                 printContainer.innerHTML = '';
                 printContainer.appendChild(clonedTable);
-                
                 window.print();
             } else {
                 showToast('Tabel peringkat tidak ditemukan', 'error');
             }
         };
 
-        // --- JURY LOGIC ---
+        // --- JURY LOGIC (UI RENDER) ---
         let activeMainTab = 'questions'; 
-
         window.switchMainTab = (tab) => {
             activeMainTab = tab;
             renderJudgeDashboard();
@@ -918,15 +1008,17 @@
             const filteredQuestions = questions.filter(q => q.subject === judgeSelectedSubject);
             const filteredParticipants = users.filter(u => u.role === 'student' && u.subjects && u.subjects.includes(judgeSelectedSubject));
             const filteredQuestionIds = filteredQuestions.map(q => q.id);
+            // Juga muat jawaban dari pending sync lokal (opsional jika judge run di browser yang sama dengan student - jarang terjadi)
+            // Kita fokus pada data real-time di Firebase untuk Judge.
             const filteredAnswers = answers.filter(a => filteredQuestionIds.includes(a.questionId));
 
-            // --- CALCULATE SCORES FOR RANKING ---
+            // --- CALCULATE SCORES ---
             let userScores = {};
             filteredParticipants.forEach(u => {
                 userScores[u.id] = { 
                     total: 0, name: u.name, school: u.school, lastActive: 0,
                     duration: u.examDuration || null,
-                    userId: u.id, // simpan ID untuk referensi
+                    userId: u.id, 
                     status: u.status || 'idle'
                 };
             });
@@ -944,27 +1036,21 @@
                 }
             });
 
-            // Override score if user has finished and score is saved in DB
             filteredParticipants.forEach(u => {
                 if(u.status === 'finished' && u.score !== undefined) {
                     if(userScores[u.id]) userScores[u.id].total = u.score;
                 }
             });
 
-            // Sort Rankings
             const rankings = Object.values(userScores).sort((a, b) => {
                 if (b.total !== a.total) return b.total - a.total;
                 return a.lastActive - b.lastActive;
             });
 
             const subjectLabel = judgeSelectedSubject === 'matematika' ? 'Matematika' : judgeSelectedSubject.toUpperCase();
-            
-            // --- CONFIG LOGIC ---
-            // Cek dari appSettings global
             const isLocked = (appSettings.locks && appSettings.locks[judgeSelectedSubject] !== undefined) ? appSettings.locks[judgeSelectedSubject] : true;
             const examDuration = (appSettings.durations && appSettings.durations[judgeSelectedSubject]) ? appSettings.durations[judgeSelectedSubject] : 60;
 
-            // Visual Lock Status
             const lockIconColor = isLocked ? 'var(--danger)' : 'var(--success-dark)';
             const lockIconClass = isLocked ? 'fa-lock' : 'fa-lock-open';
             const statusText = isLocked ? 'DIKUNCI (Siswa tidak bisa akses)' : 'DIBUKA (Siswa bisa akses)';
@@ -996,11 +1082,9 @@
 
             if (activeMainTab === 'questions') {
                 const switchId = `lock-toggle-${judgeSelectedSubject}`;
-                
                 html += `
                     <div style="display:flex; flex-direction:column; gap:15px; margin-bottom:20px;">
                         <h3><i class="fas fa-database"></i> Bank Soal: ${subjectLabel}</h3>
-                        
                         <div class="switch-container">
                             <div style="width:100%; display:flex; flex-direction:column; gap:15px;">
                                 <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #eee; padding-bottom:10px;">
@@ -1011,8 +1095,6 @@
                                             <div id="lock-status-text" style="font-weight: bold;">${statusText}</div>
                                         </div>
                                     </div>
-                                    <!-- Switch Structure -->
-                                    <!-- Logic: If DB Locked (true), Input should be Unchecked -->
                                     <label class="switch-wrapper">
                                         <input type="checkbox" id="${switchId}" 
                                             ${!isLocked ? 'checked' : ''}
@@ -1021,7 +1103,6 @@
                                         <span class="slider"></span>
                                     </label>
                                 </div>
-
                                 <div style="display:flex; align-items:center; gap:10px;">
                                     <div class="switch-label" style="flex:1; margin-bottom:0;">
                                         <i class="fas fa-stopwatch" style="color: var(--primary);"></i>
@@ -1037,7 +1118,6 @@
                                 </div>
                             </div>
                         </div>
-
                         <div style="display:flex; gap:10px; flex-wrap:wrap;">
                             <button onclick="openPreviewModal()" class="btn btn-warning"><i class="fas fa-eye"></i> Preview</button>
                             <button onclick="openJsonModal()" class="btn btn-success"><i class="fas fa-file-code"></i> Upload JSON</button>
@@ -1060,28 +1140,15 @@
                         `).join('')}
                     </div>
                 `;
-            } 
-            else if (activeMainTab === 'ranking') {
+            } else if (activeMainTab === 'ranking') {
                 html += `
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
                         <h3><i class="fas fa-trophy"></i> Peringkat ${subjectLabel}</h3>
-                        <button onclick="window.printRanking()" class="btn btn-primary no-print">
-                            <i class="fas fa-print"></i> Cetak Peringkat (PDF)
-                        </button>
+                        <button onclick="window.printRanking()" class="btn btn-primary no-print"><i class="fas fa-print"></i> Cetak Peringkat (PDF)</button>
                     </div>
                     <div class="table-responsive">
                         <table>
-                            <thead>
-                                <tr>
-                                    <th>Rank</th>
-                                    <th>Nama</th>
-                                    <th>Sekolah</th>
-                                    <th>Status</th>
-                                    <th>Durasi</th>
-                                    <th style="text-align:center; color:var(--primary);">Skor</th>
-                                    <th class="no-print">Aksi</th>
-                                </tr>
-                            </thead>
+                            <thead><tr><th>Rank</th><th>Nama</th><th>Sekolah</th><th>Status</th><th>Durasi</th><th style="text-align:center; color:var(--primary);">Skor</th><th class="no-print">Aksi</th></tr></thead>
                             <tbody>
                                 ${rankings.length === 0 ? '<tr><td colspan="7" style="text-align:center; color:#666;">Belum ada data peringkat.</td></tr>' : ''}
                                 ${rankings.map((r, idx) => {
@@ -1095,16 +1162,7 @@
                                             durationDisplay = window.formatDuration(diff);
                                         }
                                     }
-
-                                    let statusBadge = '';
-                                    if (r.status === 'finished') {
-                                        statusBadge = '<span class="badge status-finished"><i class="fas fa-check"></i> Selesai</span>';
-                                    } else if (r.status === 'working') {
-                                        statusBadge = '<span class="badge status-working"><i class="fas fa-pen"></i> Mengerjakan</span>';
-                                    } else {
-                                        statusBadge = '<span class="badge status-idle"><i class="fas fa-hourglass-start"></i> Idle</span>';
-                                    }
-
+                                    let statusBadge = r.status === 'finished' ? '<span class="badge status-finished"><i class="fas fa-check"></i> Selesai</span>' : (r.status === 'working' ? '<span class="badge status-working"><i class="fas fa-pen"></i> Mengerjakan</span>' : '<span class="badge status-idle"><i class="fas fa-hourglass-start"></i> Idle</span>');
                                     return `
                                     <tr>
                                         <td>#${idx + 1}</td>
@@ -1115,9 +1173,7 @@
                                         <td style="text-align:center;"><strong style="color:var(--primary); font-size:1.2rem;">${r.total}</strong></td>
                                         <td class="no-print">
                                             <div style="display:flex; gap:5px;">
-                                                <button onclick="window.openScoreModal('${r.userId}', ${r.total}, ${r.duration || 0})" class="btn btn-warning btn-sm" title="Edit Manual Skor & Durasi">
-                                                    <i class="fas fa-edit"></i>
-                                                </button>
+                                                <button onclick="window.openScoreModal('${r.userId}', ${r.total}, ${r.duration || 0})" class="btn btn-warning btn-sm" title="Edit Manual Skor & Durasi"><i class="fas fa-edit"></i></button>
                                             </div>
                                         </td>
                                     </tr>
@@ -1126,109 +1182,65 @@
                         </table>
                     </div>
                 `;
-            } 
-            else {
-                // --- PARTICIPANTS TAB (HANYA DATA, TANPA SKOR & STATUS) ---
+            } else {
                 html += `
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
                         <h3><i class="fas fa-users"></i> Data Peserta ${subjectLabel}</h3>
-                        <button onclick="window.sendGlobalWarning('PERHATIAN: Jangan melakukan kecurangan! Perhatikan waktu pengerjaan!')" class="btn btn-warning">
-                            <i class="fas fa-bullhorn"></i> Kirim Peringatan ke Semua
-                        </button>
+                        <button onclick="window.sendGlobalWarning('PERHATIAN: Jangan melakukan kecurangan! Perhatikan waktu pengerjaan!')" class="btn btn-warning"><i class="fas fa-bullhorn"></i> Kirim Peringatan ke Semua</button>
                     </div>
                     <div class="table-responsive">
-                        <table>
-                            <thead><tr><th>Nama</th><th>Username</th><th>Sekolah</th><th class="no-print">Aksi</th></tr></thead>
-                            <tbody>
-                                ${filteredParticipants.map(s => {
-                                    return `
-                                    <tr>
-                                        <td>${s.name}</td>
-                                        <td>${s.username}</td>
-                                        <td>${s.school}</td>
-                                        <td class="no-print">
-                                            <div style="display:flex; gap:5px;">
-                                                <button onclick="window.sendWarningToUser('${s.id}', 'PERINGATAN: Fokuslah pada soalmu!')" class="btn btn-warning" style="padding:4px 8px; font-size:0.8rem;" title="Kirim Peringatan">
-                                                    <i class="fas fa-bell"></i>
-                                                </button>
-                                                <button onclick="window.deleteUser('${s.id}', '${s.name}')" class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem;" title="Hapus">
-                                                    <i class="fas fa-trash"></i>
-                                                </button>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                `}).join('')}
-                            </tbody>
-                        </table>
+                        <table><thead><tr><th>Nama</th><th>Username</th><th>Sekolah</th><th class="no-print">Aksi</th></tr></thead><tbody>
+                        ${filteredParticipants.map(s => `
+                            <tr>
+                                <td>${s.name}</td>
+                                <td>${s.username}</td>
+                                <td>${s.school}</td>
+                                <td class="no-print">
+                                    <div style="display:flex; gap:5px;">
+                                        <button onclick="window.sendWarningToUser('${s.id}', 'PERINGATAN: Fokuslah pada soalmu!')" class="btn btn-warning" style="padding:4px 8px; font-size:0.8rem;" title="Kirim Peringatan"><i class="fas fa-bell"></i></button>
+                                        <button onclick="window.deleteUser('${s.id}', '${s.name}')" class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem;" title="Hapus"><i class="fas fa-trash"></i></button>
+                                    </div>
+                                </td>
+                            </tr>
+                        `).join('')}
+                        </tbody></table>
                     </div>
                 `;
             }
-
             html += `</div>`;
             container.innerHTML = html;
         };
 
-        // --- PREVIEW ALL LOGIC ---
+        // --- PREVIEW & CRUD (Sama seperti sebelumnya) ---
         window.openPreviewModal = () => {
             const container = document.getElementById('preview-list-container');
             const modal = document.getElementById('preview-modal');
             const filteredQuestions = questions.filter(q => q.subject === judgeSelectedSubject);
-            
             let html = '';
             filteredQuestions.forEach((q, index) => {
-                html += `
-                    <div class="preview-item">
-                        <div style="margin-bottom:5px;">
-                            <span class="badge badge-${q.subject}">${q.subject.toUpperCase()}</span>
-                            <strong style="margin-left:10px;">Soal #${index + 1}</strong>
-                            <span style="float:right; color:#666; font-size:0.8rem;">Kunci: ${q.correct}</span>
-                        </div>
-                        <p style="font-weight:600; margin-bottom:5px;">${q.text}</p>
-                        ${q.image ? `<img src="${q.image}" class="preview-img">` : ''}
-                        <div style="margin-top:10px;">
-                            ${['A', 'B', 'C', 'D'].map(opt => `
-                                <div class="preview-opt">
-                                    <strong>${opt}.</strong> 
-                                    <span>${q.options[opt]}</span>
-                                    ${q.options[opt + '_img'] ? `<img src="${q.options[opt + '_img']}" style="max-height:30px; margin-left:5px;">` : ''}
-                                </div>
-                            `).join('')}
-                        </div>
-                    </div>
-                `;
+                html += `<div class="preview-item"><div style="margin-bottom:5px;"><span class="badge badge-${q.subject}">${q.subject.toUpperCase()}</span><strong style="margin-left:10px;">Soal #${index + 1}</strong><span style="float:right; color:#666; font-size:0.8rem;">Kunci: ${q.correct}</span></div><p style="font-weight:600; margin-bottom:5px;">${q.text}</p>${q.image ? `<img src="${q.image}" class="preview-img">` : ''}<div style="margin-top:10px;">${['A', 'B', 'C', 'D'].map(opt => `<div class="preview-opt"><strong>${opt}.</strong> <span>${q.options[opt]}</span>${q.options[opt + '_img'] ? `<img src="${q.options[opt + '_img']}" style="max-height:30px; margin-left:5px;">` : ''}</div>`).join('')}</div></div>`;
             });
             container.innerHTML = html || '<p style="text-align:center; padding:20px;">Belum ada soal.</p>';
             modal.style.display = 'flex';
         };
 
-        // --- PARTICIPANT MANAGEMENT ---
         window.deleteUser = async (userId, userName) => {
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             if (confirm(`Yakin ingin menghapus peserta "${userName}"?`)) {
                 try {
                     await deleteDoc(doc(db, "users", userId));
                     const userAnswers = answers.filter(a => a.userId === userId);
-                    for (const ans of userAnswers) {
-                        await deleteDoc(doc(db, "answers", ans.id));
-                    }
+                    for (const ans of userAnswers) await deleteDoc(doc(db, "answers", ans.id));
                     showToast(`Peserta ${userName} berhasil dihapus`, 'success');
-                } catch (err) {
-                    showToast('Gagal menghapus: ' + err.message, 'error');
-                }
+                } catch (err) { showToast('Gagal menghapus: ' + err.message, 'error'); }
             }
         };
 
-        // --- JSON UPLOAD & CRUD ---
-        window.openJsonModal = () => {
-            if(judgeSelectedSubject) {
-                document.getElementById('json-subject').value = judgeSelectedSubject;
-            }
-            document.getElementById('json-modal').style.display = 'flex';
-        };
-
+        window.openJsonModal = () => { if(judgeSelectedSubject) document.getElementById('json-subject').value = judgeSelectedSubject; document.getElementById('json-modal').style.display = 'flex'; };
         window.processJsonUpload = async () => {
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             const jsonStr = document.getElementById('json-input').value;
             const selectedSubject = document.getElementById('json-subject').value;
-
             try {
                 const data = JSON.parse(jsonStr);
                 if (!Array.isArray(data)) throw new Error("Format harus berupa Array JSON");
@@ -1236,11 +1248,7 @@
                 for (const item of data) {
                     const finalSubject = item.subject || selectedSubject;
                     if (finalSubject && item.text && item.options && item.correct) {
-                        await addDoc(collection(db, "questions"), { 
-                            ...item, 
-                            subject: finalSubject, 
-                            createdAt: serverTimestamp() 
-                        });
+                        await addDoc(collection(db, "questions"), { ...item, subject: finalSubject, createdAt: serverTimestamp() });
                         successCount++;
                     }
                 }
@@ -1248,10 +1256,7 @@
                 showToast(`Berhasil mengupload ${successCount} soal ke Mapel ${selectedSubject.toUpperCase()}!`, 'success');
                 closeModal('json-modal');
                 document.getElementById('json-input').value = '';
-            } catch (e) {
-                console.error(e);
-                showToast('Format JSON salah: ' + e.message, 'error');
-            }
+            } catch (e) { showToast('Format JSON salah: ' + e.message, 'error'); }
         };
 
         window.openQuestionModal = (editId = null) => {
@@ -1261,7 +1266,6 @@
             modal.style.display = 'flex';
             form.reset();
             document.getElementById('q-id').value = '';
-
             if (editId) {
                 const q = questions.find(x => x.id === editId);
                 if (q) {
@@ -1282,15 +1286,14 @@
                 }
             } else {
                 title.innerHTML = `<i class="fas fa-plus"></i> Tambah Soal Baru`;
-                if(judgeSelectedSubject) {
-                    document.getElementById('q-subject').value = judgeSelectedSubject;
-                }
+                if(judgeSelectedSubject) document.getElementById('q-subject').value = judgeSelectedSubject;
             }
         };
         window.editQuestion = window.openQuestionModal;
 
         document.getElementById('question-form').addEventListener('submit', async (e) => {
             e.preventDefault();
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             const id = document.getElementById('q-id').value;
             const data = {
                 subject: document.getElementById('q-subject').value,
@@ -1306,29 +1309,16 @@
                 updatedAt: serverTimestamp()
             };
             try {
-                if (id) {
-                    await updateDoc(doc(db, "questions", id), data);
-                    showToast('Soal berhasil diperbarui!', 'success');
-                } else {
-                    data.createdAt = serverTimestamp();
-                    await addDoc(collection(db, "questions"), data);
-                    showToast('Soal berhasil ditambahkan!', 'success');
-                }
+                if (id) { await updateDoc(doc(db, "questions", id), data); showToast('Soal berhasil diperbarui!', 'success'); }
+                else { data.createdAt = serverTimestamp(); await addDoc(collection(db, "questions"), data); showToast('Soal berhasil ditambahkan!', 'success'); }
                 closeModal('question-modal');
-            } catch (err) {
-                console.error(err);
-                showToast('Gagal menyimpan soal: ' + err.message, 'error');
-            }
+            } catch (err) { showToast('Gagal menyimpan soal: ' + err.message, 'error'); }
         });
 
         window.deleteQuestion = async (id) => {
+            if(!navigator.onLine) return showToast('Tidak ada koneksi internet', 'error');
             if(confirm('Hapus soal ini?')) {
-                try {
-                    await deleteDoc(doc(db, "questions", id));
-                    showToast('Soal dihapus', 'success');
-                } catch(err) {
-                    showToast('Gagal menghapus: ' + err.message, 'error');
-                }
+                try { await deleteDoc(doc(db, "questions", id)); showToast('Soal dihapus', 'success'); } catch(err) { showToast('Gagal menghapus: ' + err.message, 'error'); }
             }
         };
 
@@ -1337,70 +1327,36 @@
             const filteredQuestions = questions.filter(q => q.subject === judgeSelectedSubject);
             const filteredQuestionIds = filteredQuestions.map(q => q.id);
             const userAnswers = answers.filter(a => a.userName === name && a.userSchool === school && filteredQuestionIds.includes(a.questionId));
-
-            let html = `
-                <div class="card">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h2>Jawaban: ${name} (${school})</h2>
-                        <button onclick="window.renderJudgeDashboard()" class="btn btn-outline">Kembali</button>
-                    </div>
-                    <div style="margin-top:20px;">
-            `;
+            let html = `<div class="card"><div style="display:flex; justify-content:space-between; align-items:center;"><h2>Jawaban: ${name} (${school})</h2><button onclick="window.renderJudgeDashboard()" class="btn btn-outline">Kembali</button></div><div style="margin-top:20px;">`;
             filteredQuestions.forEach(q => {
                 const ans = userAnswers.find(a => a.questionId === q.id);
-                const status = (ans && ans.selected === q.correct) 
-                    ? '<span style="color:var(--success); font-weight:bold;">BENAR</span>' 
-                    : '<span style="color:var(--danger); font-weight:bold;">SALAH</span>';
+                const status = (ans && ans.selected === q.correct) ? '<span style="color:var(--success); font-weight:bold;">BENAR</span>' : '<span style="color:var(--danger); font-weight:bold;">SALAH</span>';
                 const studentAns = ans ? ans.selected : '-';
-
-                html += `
-                    <div style="border-bottom:1px solid var(--gray); padding:15px 0;">
-                        <div class="badge badge-${q.subject}">${q.subject}</div>
-                        <p style="margin:10px 0; font-weight:bold;">${q.text}</p>
-                        ${q.image ? `<img src="${q.image}" style="max-height:100px; margin-bottom:10px;">` : ''}
-                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; font-size:0.9rem; background:#f8f9fa; padding:10px; border-radius:8px;">
-                            <div>Jawaban: <strong>${studentAns}</strong></div>
-                            <div>Kunci: <strong>${q.correct}</strong></div>
-                        </div>
-                        <div style="text-align:right; margin-top:5px;">${status}</div>
-                    </div>
-                `;
+                html += `<div style="border-bottom:1px solid var(--gray); padding:15px 0;"><div class="badge badge-${q.subject}">${q.subject}</div><p style="margin:10px 0; font-weight:bold;">${q.text}</p>${q.image ? `<img src="${q.image}" style="max-height:100px; margin-bottom:10px;">` : ''}<div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; font-size:0.9rem; background:#f8f9fa; padding:10px; border-radius:8px;"><div>Jawaban: <strong>${studentAns}</strong></div><div>Kunci: <strong>${q.correct}</strong></div></div><div style="text-align:right; margin-top:5px;">${status}</div></div>`;
             });
-            html += `</div></div>`;
-            container.innerHTML = html;
+            html += `</div></div>`; container.innerHTML = html;
         };
 
-        // --- STUDENT LOGIC ---
+        // --- STUDENT LOGIC (OFFLINE CAPABLE) ---
         function getStudentQuestions() {
             if (!currentUser.subjects || currentUser.subjects.length === 0) return [];
+            // Filter dari array questions (yang sudah di-download di awal)
             return questions.filter(q => currentUser.subjects.includes(q.subject));
         }
 
         window.renderStudentDashboard = () => {
             const container = document.getElementById('main-content');
             const myQuestions = getStudentQuestions();
-            
             const subject = currentUser.subjects[0];
             
-            // Cek Lock Status dari Settings (Dibaca Real-time)
-            // DB: true = Locked (Tidak boleh akses), false = Unlocked (Boleh akses)
+            // Cek Lock Status dari Settings
             const isLocked = (appSettings.locks && appSettings.locks[subject] !== undefined) ? appSettings.locks[subject] : true;
             const examDuration = (appSettings.durations && appSettings.durations[subject]) ? appSettings.durations[subject] : 60;
 
             if (!container) return;
 
-            // Jika DIKUNCI, tampilkan layar kunci
             if (isLocked) {
-                container.innerHTML = `
-                    <div class="card exam-locked-screen">
-                        <i class="fas fa-lock"></i>
-                        <h2>Ujian Belum Dibuka</h2>
-                        <p style="color:#666; margin-top:10px;">Mohon tunggu hingga Juri membuka akses soal untuk mata pelajaran ${subject.toUpperCase()}.</p>
-                        <div style="margin-top:20px;">
-                            <div class="badge badge-${subject}">${subject.toUpperCase()}</div>
-                        </div>
-                    </div>
-                `;
+                container.innerHTML = `<div class="card exam-locked-screen"><i class="fas fa-lock"></i><h2>Ujian Belum Dibuka</h2><p style="color:#666; margin-top:10px;">Mohon tunggu hingga Juri membuka akses soal untuk mata pelajaran ${subject.toUpperCase()}.</p><div style="margin-top:20px;"><div class="badge badge-${subject}">${subject.toUpperCase()}</div></div></div>`;
                 if(timerInterval) clearInterval(timerInterval);
                 return;
             }
@@ -1410,6 +1366,7 @@
                 return;
             }
 
+            // Init Timer
             if (!examStartTime) {
                 examStartTime = new Date();
                 startTimer(examDuration); 
@@ -1417,6 +1374,7 @@
                 startTimer(examDuration);
             }
 
+            // Load answers from local variable (synced from db + local changes)
             const myAnswers = answers.filter(a => a.userId === currentUser.id);
             const myAnsMap = {};
             myAnswers.forEach(a => myAnsMap[a.questionId] = a.selected);
@@ -1439,10 +1397,8 @@
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
                             <span style="font-weight:bold; color:var(--dark); font-size:0.9rem;">Soal ${currentQuestionIndex + 1} / ${myQuestions.length}</span>
                         </div>
-                        
                         <h3 style="margin-bottom:20px; font-size:1.2rem; line-height:1.5;">${q.text}</h3>
                         ${q.image ? `<img src="${q.image}" alt="Soal Image" style="width:100%; border-radius:12px;">` : ''}
-                        
                         <div class="options-area" style="margin-top:20px;">
                             ${['A', 'B', 'C', 'D'].map(opt => `
                                 <label class="option-label" style="border-color: ${myAnsMap[q.id] === opt ? 'var(--primary)' : ''}; background: ${myAnsMap[q.id] === opt ? '#eef2ff' : ''}">
@@ -1456,7 +1412,6 @@
                                 </label>
                             `).join('')}
                         </div>
-
                         <div style="display:flex; justify-content:space-between; margin-top:30px; gap:10px;">
                             <button onclick="window.changeQuestion(-1)" class="btn btn-outline" ${currentQuestionIndex === 0 ? 'disabled' : ''} style="flex:1;"><i class="fas fa-arrow-left"></i> Sebelumnya</button>
                             ${currentQuestionIndex === myQuestions.length - 1 
@@ -1500,7 +1455,9 @@
             timerInterval = setInterval(updateTimer, 1000);
         }
 
+        // Simpan jawaban secara lokal (array `answers`)
         window.saveAnswer = async (qId, option) => {
+            // Simpan ke memori lokal untuk rendering
             const existingIndex = answers.findIndex(a => a.userId === currentUser.id && a.questionId === qId);
             const data = {
                 userId: currentUser.id,
@@ -1508,16 +1465,45 @@
                 userSchool: currentUser.school,
                 questionId: qId,
                 selected: option,
-                timestamp: serverTimestamp()
+                timestamp: new Date() // Local timestamp for sorting
             };
 
             if (existingIndex > -1) {
                 answers[existingIndex] = { ...answers[existingIndex], ...data, id: answers[existingIndex].id };
-                await updateDoc(doc(db, "answers", answers[existingIndex].id), data);
             } else {
-                const docRef = await addDoc(collection(db, "answers"), data);
-                answers.push({ id: docRef.id, ...data });
+                answers.push({ id: 'local_' + Date.now(), ...data }); // Temporary ID
             }
+            
+            // Jika Online, langsung kirim ke Firebase
+            if (navigator.onLine) {
+                try {
+                    // Cek apakah ini update atau baru
+                    const existingDb = existingIndex > -1 && answers[existingIndex].id && !answers[existingIndex].id.startsWith('local_');
+                    if (existingDb) {
+                        await updateDoc(doc(db, "answers", answers[existingIndex].id), {
+                            selected: option,
+                            timestamp: serverTimestamp()
+                        });
+                    } else {
+                        const docRef = await addDoc(collection(db, "answers"), {
+                            userId: currentUser.id,
+                            userName: currentUser.name,
+                            userSchool: currentUser.school,
+                            questionId: qId,
+                            selected: option,
+                            timestamp: serverTimestamp()
+                        });
+                        // Update local ID dengan real ID
+                        answers[answers.length - 1].id = docRef.id;
+                    }
+                } catch (e) {
+                    console.error("Gagal sync jawaban real-time, menyimpan lokal saja:", e);
+                    showToast('Jawaban disimpan lokal (Offline)', 'info');
+                }
+            } else {
+                showToast('Jawaban disimpan lokal (Offline)', 'info');
+            }
+
             window.renderStudentDashboard();
         };
 
@@ -1529,33 +1515,75 @@
         window.finishExam = async () => {
             if(timerInterval) clearInterval(timerInterval);
             const myQuestions = getStudentQuestions();
-            const myAnswers = answers.filter(a => a.userId === currentUser.id);
+            
+            // Hitung skor berdasarkan jawaban lokal
             let score = 0;
+            const myAnswers = answers.filter(a => a.userId === currentUser.id);
             
             myQuestions.forEach(q => {
                 const ans = myAnswers.find(a => a.questionId === q.id);
-                if (ans && ans.selected === q.correct) {
-                    score += 10;
-                }
+                if (ans && ans.selected === q.correct) score += 10;
             });
 
             const now = Date.now();
             const durationMs = now - examStartTime.getTime();
 
-            try {
-                await updateDoc(doc(db, "users", currentUser.id), {
-                    status: 'finished',
-                    score: score,
-                    examDuration: durationMs, 
-                    finishedAt: serverTimestamp()
-                });
-            } catch (e) {
-                console.error("Error updating user status:", e);
-            }
+            // Siapkan data untuk dikirim (atau disimpan pending)
+            const submitData = {
+                userId: currentUser.id,
+                score: score,
+                durationMs: durationMs,
+                rawAnswers: myAnswers.map(a => ({
+                    userId: a.userId,
+                    userName: a.userName,
+                    userSchool: a.userSchool,
+                    questionId: a.questionId,
+                    selected: a.selected
+                }))
+            };
 
             const overlay = document.getElementById('result-overlay');
             document.getElementById('final-score-display').innerText = score;
             document.getElementById('final-duration-display').innerText = window.formatDuration(durationMs);
+            
+            const offlineMsg = document.getElementById('offline-pending-msg');
+
+            if (navigator.onLine) {
+                // ONLINE: Langsung kirim
+                offlineMsg.style.display = 'none';
+                try {
+                    // Update Status User ke FINISHED
+                    await updateDoc(doc(db, "users", currentUser.id), {
+                        status: 'finished',
+                        score: score,
+                        examDuration: durationMs, 
+                        finishedAt: serverTimestamp()
+                    });
+
+                    // Pastikan semua jawaban terkirim (jika ada yang belum ke-upload saat saveAnswer offline tadi)
+                    for (const ans of submitData.rawAnswers) {
+                        // Cek duplikasi di server (simplified logic: just addDoc, kita anggap jawaban id unik atau idempotent handle di sisi server jika perlu)
+                        // Untuk keamanan, kita cek dulu apakah sudah ada
+                        // Tapi agar cepat, kita asumsikan saveAnswer tadi sudah bekerja. Kita hanya perlu memastikan status user finished.
+                        // Kita tambahkan logika bulk upload jika rawAnswers berisi ID 'local_'
+                        if (answers.find(la => la.questionId === ans.questionId && la.id.startsWith('local_'))) {
+                             await addDoc(collection(db, "answers"), { ...ans, timestamp: serverTimestamp() });
+                        }
+                    }
+                    showToast('Jawaban terkirim!', 'success');
+
+                } catch (e) {
+                    console.error("Gagal saat finish online:", e);
+                    showToast('Gagal mengirim data, menyimpan lokal...', 'error');
+                    savePendingSubmission(submitData);
+                    offlineMsg.style.display = 'block';
+                }
+            } else {
+                // OFFLINE: Simpan ke Pending
+                offlineMsg.style.display = 'block';
+                savePendingSubmission(submitData);
+            }
+
             overlay.style.display = 'flex';
 
             let countdown = 5;
@@ -1598,8 +1626,10 @@
                 });
                 console.log("Default Settings Created");
             }
+            
+            // Cek status koneksi awal
+            updateConnectionStatus();
         })();
-
     </script>
 </body>
 </html>
